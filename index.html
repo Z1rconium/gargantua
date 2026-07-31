@@ -1,0 +1,70 @@
+<!doctype html>
+<!--
+  GARGANTUA — Schwarzschild Black Hole Raytracer
+
+  THESIS: the integrated spacetime is the entire page; instrumentation floats as etched
+  telemetry at the edges. Refuses the category default — "a canvas demo inside a card page".
+  OWN-WORLD: void black; one accretion-gold accent taken from the disk's own blackbody;
+  1px hairlines and corner ticks; mono for measurement, tracked caps for labels; zero radii,
+  zero shadows; the only filled surface is the functional parameter drawer.
+  STORY: visitor falls into orbit around a live physical integration, reads proof in the
+  telemetry, bends 21 physical dials, leaves with the photon ring burned into memory.
+  FIRST VIEWPORT: full-bleed lensed black hole slightly off-axis; wordmark top-left,
+  telemetry top-right, drawer toggle bottom-left, presets/quality bottom-right, keys centered.
+  FORM: pinned by the brief (cinematic scientific-instrument HUD); pinned direction beats the roll.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#030405">
+<title>GARGANTUA — Schwarzschild Black Hole Raytracer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23030405'/%3E%3Ccircle cx='32' cy='32' r='16' fill='none' stroke='%23f2a45c' stroke-width='3'/%3E%3Ccircle cx='32' cy='32' r='9' fill='%23000'/%3E%3Cellipse cx='32' cy='32' rx='27' ry='6' fill='none' stroke='%23f2a45c' stroke-width='2' opacity='.7'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/controls/OrbitControls.js": "./vendor/OrbitControls.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<canvas id="view" aria-label="Real-time raytraced Schwarzschild black hole"></canvas>
+
+<!-- Boot overlay: shown before any JS runs; main.js drives its states -->
+<div id="boot" class="boot" role="status">
+  <div class="boot-inner">
+    <div class="boot-mark">GARGANTUA</div>
+    <div class="boot-sub">SCHWARZSCHILD NULL-GEODESIC RAYTRACER</div>
+    <div class="boot-bar"><div class="boot-bar-fill" id="boot-fill"></div></div>
+    <div class="boot-status" id="boot-status">INITIALIZING WEBGL2 CONTEXT</div>
+  </div>
+</div>
+
+<!-- Fatal error card: filled by JS on unrecoverable failure -->
+<div id="fatal" class="fatal" hidden role="alert">
+  <div class="fatal-card">
+    <div class="fatal-title">INTEGRATION HALTED</div>
+    <p class="fatal-msg" id="fatal-msg"></p>
+    <p class="fatal-hint" id="fatal-hint"></p>
+    <button class="btn" id="fatal-reload" type="button">REINITIALIZE</button>
+  </div>
+</div>
+
+<div id="hud" class="hud" hidden></div>
+
+<noscript>
+  <div class="fatal" style="display:flex">
+    <div class="fatal-card">
+      <div class="fatal-title">JAVASCRIPT REQUIRED</div>
+      <p class="fatal-msg">This raytracer integrates geodesics on your GPU and cannot run without JavaScript.</p>
+    </div>
+  </div>
+</noscript>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
