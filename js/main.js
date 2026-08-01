@@ -210,9 +210,14 @@ function updateCameraBasis(time) {
   camFwd.set(-e[8], -e[9], -e[10]);
   camPos.copy(perspCam.position);
 
-  /* the razor-thin disk vanishes exactly edge-on: keep the eye a hair off the plane */
+  /* the razor-thin disk vanishes exactly edge-on: nudge the ray origin off the plane
+     with a smooth odd function of y instead of a hard floor. It has no flat region
+     and no branch/state, so pitching through y=0 stays continuous and never sticks
+     or snaps the ray origin ("teleporting" the rendered view). */
   const r = camPos.length();
-  if (Math.abs(camPos.y) < 0.03 * r) camPos.y = (camPos.y >= 0 ? 1 : -1) * 0.03 * r;
+  const edge = 0.03 * r;
+  const y = camPos.y;
+  camPos.y = y + (edge * edge * y) / (y * y + edge * edge);
 }
 
 /* ---------------- render ---------------- */
