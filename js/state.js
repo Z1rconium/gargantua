@@ -34,7 +34,8 @@ export function clearState() {
    ?cine=0|1           cinematic loop on/off
    ?music=0|1          ambient audio on/off
    ?hud=0              hide HUD
-   ?shot=1             render, auto-download a PNG, set window.__GARGANTUA_SHOT_DONE */
+   ?shot=1             render, auto-download a PNG, set window.__GARGANTUA_SHOT_DONE
+   ?bench=1            load hidden shader benchmark automation (see README) */
 export function parseQuery() {
   const q = new URLSearchParams(location.search);
   const num = (k) => (q.has(k) ? parseFloat(q.get(k)) : null);
@@ -51,5 +52,9 @@ export function parseQuery() {
     hud: bool('hud'),
     shot: bool('shot'),
     probe: bool('probe'),
+    bench: bool('bench'),
+    integrator: q.get('int'),
+    tolerance: q.get('tol'),
+    noiseMask: int('noiseMask'),
   };
 }

@@ -49,8 +49,14 @@ uniform float uPhiMax;
 uniform float uStarDensity;
 uniform float uMilkyWay;
 uniform int   uDebug;
+uniform int   uBenchMode;
 
 #define MAXS 768
+#define INTEGRATOR_RKCK 0
+/* GPU A/B winner: 3-octave sky fine/dust and disk-secondary FBM. */
+#define NOISE_MASK 7
+#define RK_REL_TOL 2e-5
+#define RK_ABS_TOL 2e-7
 const float PI = 3.141592653589793;
 
 /* ---------------- hashing / noise ---------------- */
@@ -90,6 +96,16 @@ float fbm(vec3 p) {
     a *= 0.5;
   }
   return r; /* ~[0,1) */
+}
+
+float fbm3(vec3 p) {
+  float a = 0.5, r = 0.0;
+  for (int i = 0; i < 3; i++) {
+    r += a * vnoise(p);
+    p = p * 2.03 + vec3(11.7, 5.3, 7.1);
+    a *= 0.5;
+  }
+  return r * (31.0 / 28.0);
 }
 
 /* ---------------- radiometry ---------------- */
@@ -144,8 +160,16 @@ vec3 skyColor(vec3 d) {
   float core = dot(d, galC);
   float dens = exp(-band * band * 22.0);
   float neb  = fbm(d * 7.0 + 3.1);
+#if (NOISE_MASK & 1) != 0
+  float fine = fbm3(d * 19.0 - 7.7);
+#else
   float fine = fbm(d * 19.0 - 7.7);
+#endif
+#if (NOISE_MASK & 2) != 0
+  float dust = fbm3(d * 11.0 + vec3(4.2, -8.8, 1.5));
+#else
   float dust = fbm(d * 11.0 + vec3(4.2, -8.8, 1.5));
+#endif
   float mw = dens * (0.30 + 0.55 * neb + 0.35 * fine * neb);
   mw *= 1.0 - 0.72 * smoothstep(0.48, 0.78, dust) * dens;
   float coreGlow = pow(max(core, 0.0), 3.0) * dens;
@@ -177,7 +201,11 @@ vec3 diskSample(vec3 P, vec3 marchDir, float camR, out float alpha, out vec3 dbg
   vec3 q = vec3(1.8 * cos(a), 1.8 * sin(a), log(r) * 6.0) * uTurbDetail;
   q += uTime * 0.045 * uFlowSpeed * vec3(0.31, 0.17, 0.23);
   float n = fbm(q);
+#if (NOISE_MASK & 4) != 0
+  n = mix(n, fbm3(q * 2.7 + 13.1), 0.35);
+#else
   n = mix(n, fbm(q * 2.7 + 13.1), 0.35);
+#endif
 
   float x = clamp((r - uDiskInner) / max(uDiskOuter - uDiskInner, 1e-3), 0.0, 1.0);
   float prof = smoothstep(0.0, 0.06, x) * (0.25 + 0.75 * pow(1.0 - x, 2.2));
@@ -228,14 +256,18 @@ void main() {
   vec3 escDir = rd;
 
   int stepsUsed = 0;
+  int rejectedSteps = 0;
+  int attempts = 0;
   int nCross = 0;
+  int termination = 0; /* 1 escape, 2 horizon, 3 phi budget, 4 attempt exhaustion, 5 invalid */
+  float minStepRatio = 2.0;
   vec3 dbgFirst = vec3(0.0);
   float bImpact = r0 * pl / sqrt(max(1.0 - 1.0 / r0, 0.01));
 
   if (pl < 1e-4) {
     /* exactly radial ray: falls in or leaves in a straight line */
-    if (ddr < 0.0) captured = true;
-    else { escaped = true; escDir = rd; }
+    if (ddr < 0.0) { captured = true; termination = 2; }
+    else { escaped = true; escDir = rd; termination = 1; }
   } else {
     vec3 ep = perp / pl;
     float u = 1.0 / r0;
@@ -254,12 +286,20 @@ void main() {
       nextCross = phi0 + ceil((1e-3 - phi0) / PI) * PI;
     }
 
-    float h = uPhiMax / float(uSteps);
+    float baseH = uPhiMax / float(uSteps);
+    float h = baseH;
 
     for (int i = 0; i < MAXS; i++) {
+#if INTEGRATOR_RKCK == 0
       if (i >= uSteps) break;
+#else
+      if (phi >= uPhiMax - 1e-7) break;
+      h = min(h, uPhiMax - phi);
+#endif
       float u0 = u, w0 = w, phi0i = phi;
+      attempts++;
 
+#if INTEGRATOR_RKCK == 0
       /* RK4 on u'' = 1.5 u^2 - u */
       float k1u = w0;
       float k1w = 1.5 * u0 * u0 - u0;
@@ -276,14 +316,71 @@ void main() {
       w = w0 + (h / 6.0) * (k1w + 2.0 * k2w + 2.0 * k3w + k4w);
       phi += h;
       stepsUsed++;
+      minStepRatio = 1.0;
+#else
+      /* Cash-Karp embedded RK4/5. Rejected attempts leave (u,w,phi) unchanged. */
+      float k1u = w0;
+      float k1w = 1.5 * u0 * u0 - u0;
+      float s2u = u0 + h * (1.0 / 5.0) * k1u;
+      float s2w = w0 + h * (1.0 / 5.0) * k1w;
+      float k2u = s2w;
+      float k2w = 1.5 * s2u * s2u - s2u;
+      float s3u = u0 + h * (3.0 / 40.0 * k1u + 9.0 / 40.0 * k2u);
+      float s3w = w0 + h * (3.0 / 40.0 * k1w + 9.0 / 40.0 * k2w);
+      float k3u = s3w;
+      float k3w = 1.5 * s3u * s3u - s3u;
+      float s4u = u0 + h * (3.0 / 10.0 * k1u - 9.0 / 10.0 * k2u + 6.0 / 5.0 * k3u);
+      float s4w = w0 + h * (3.0 / 10.0 * k1w - 9.0 / 10.0 * k2w + 6.0 / 5.0 * k3w);
+      float k4u = s4w;
+      float k4w = 1.5 * s4u * s4u - s4u;
+      float s5u = u0 + h * (-11.0 / 54.0 * k1u + 5.0 / 2.0 * k2u - 70.0 / 27.0 * k3u + 35.0 / 27.0 * k4u);
+      float s5w = w0 + h * (-11.0 / 54.0 * k1w + 5.0 / 2.0 * k2w - 70.0 / 27.0 * k3w + 35.0 / 27.0 * k4w);
+      float k5u = s5w;
+      float k5w = 1.5 * s5u * s5u - s5u;
+      float s6u = u0 + h * (1631.0 / 55296.0 * k1u + 175.0 / 512.0 * k2u
+                 + 575.0 / 13824.0 * k3u + 44275.0 / 110592.0 * k4u + 253.0 / 4096.0 * k5u);
+      float s6w = w0 + h * (1631.0 / 55296.0 * k1w + 175.0 / 512.0 * k2w
+                 + 575.0 / 13824.0 * k3w + 44275.0 / 110592.0 * k4w + 253.0 / 4096.0 * k5w);
+      float k6u = s6w;
+      float k6w = 1.5 * s6u * s6u - s6u;
+      float u5 = u0 + h * (37.0 / 378.0 * k1u + 250.0 / 621.0 * k3u
+               + 125.0 / 594.0 * k4u + 512.0 / 1771.0 * k6u);
+      float w5 = w0 + h * (37.0 / 378.0 * k1w + 250.0 / 621.0 * k3w
+               + 125.0 / 594.0 * k4w + 512.0 / 1771.0 * k6w);
+      float u4 = u0 + h * (2825.0 / 27648.0 * k1u + 18575.0 / 48384.0 * k3u
+               + 13525.0 / 55296.0 * k4u + 277.0 / 14336.0 * k5u + 1.0 / 4.0 * k6u);
+      float w4 = w0 + h * (2825.0 / 27648.0 * k1w + 18575.0 / 48384.0 * k3w
+               + 13525.0 / 55296.0 * k4w + 277.0 / 14336.0 * k5w + 1.0 / 4.0 * k6w);
+      float eu = abs(u5 - u4) / (RK_ABS_TOL + RK_REL_TOL * max(abs(u0), abs(u5)));
+      float ew = abs(w5 - w4) / (RK_ABS_TOL + RK_REL_TOL * max(abs(w0), abs(w5)));
+      float err = max(eu, ew);
+      float scale = clamp(0.9 * pow(max(err, 1e-10), -0.2), 0.25, 2.0);
+      float usedH = h;
+      h = clamp(h * scale, baseH / 16.0, baseH * 2.0);
+      if (err > 1.0 && usedH > baseH / 16.0 + 1e-8) {
+        rejectedSteps++;
+        continue;
+      }
+      u = u5;
+      w = w5;
+      phi += usedH;
+      h = clamp(h, baseH / 16.0, baseH * 2.0);
+      minStepRatio = min(minStepRatio, usedH / baseH);
+      stepsUsed++;
+#endif
 
-      if (u > 1.0 || u > 1e4) { captured = true; break; }
+      if (isnan(u) || isnan(w) || isinf(u) || isinf(w)) {
+        captured = true; termination = 5; break;
+      }
+
+      if (u > 1.0 || u > 1e4) { captured = true; termination = 2; break; }
 
       if (hasCross && phi >= nextCross) {
-        float t = clamp((nextCross - phi0i) / h, 0.0, 1.0);
+        float acceptedH = phi - phi0i;
+        float t = clamp((nextCross - phi0i) / acceptedH, 0.0, 1.0);
         float t2 = t * t, t3 = t2 * t;
-        float uc = (2.0 * t3 - 3.0 * t2 + 1.0) * u0 + (t3 - 2.0 * t2 + t) * h * w0
-                 + (-2.0 * t3 + 3.0 * t2) * u + (t3 - t2) * h * w;
+        float uc = (2.0 * t3 - 3.0 * t2 + 1.0) * u0 + (t3 - 2.0 * t2 + t) * acceptedH * w0
+                 + (-2.0 * t3 + 3.0 * t2) * u + (t3 - t2) * acceptedH * w;
         float wc = mix(w0, w, t);
         if (uc > 1e-6) {
           float rc = 1.0 / uc;
@@ -312,15 +409,31 @@ void main() {
         vec3 epp = -sph * er + cph * ep;
         escDir = normalize((-w / (u * u)) * erp + (1.0 / u) * epp);
         escaped = true;
+        termination = 1;
         break;
       }
     }
-    if (!escaped && !captured) captured = true; /* wound past phi budget: inside the ring */
+    if (!escaped && !captured) {
+      captured = true;
+      termination = attempts >= MAXS ? 4 : 3;
+    }
   }
 
   vec3 col = acc;
   if (escaped && uDebug != 2) col += trans * skyColor(escDir);
   /* captured -> horizon: contributes nothing. The shadow stays deep black. */
+
+  /* Bench diagnostics use a dedicated readback target and never reach normal visits. */
+  if (uBenchMode == 1) {
+    outColor = vec4(float(stepsUsed) / 768.0, float(rejectedSteps) / 768.0,
+                    clamp((minStepRatio - 0.0625) / 1.9375, 0.0, 1.0), float(attempts) / 768.0);
+    return;
+  }
+  if (uBenchMode == 2) {
+    outColor = vec4(float(termination) / 5.0, escaped ? 1.0 : 0.0,
+                    captured ? 1.0 : 0.0, abs(bImpact - 2.598076211) <= 0.02 ? 1.0 : 0.0);
+    return;
+  }
 
   /* ---------------- debug views ---------------- */
   if (uDebug == 3) col = heat(float(stepsUsed) / float(uSteps));
@@ -346,6 +459,22 @@ void main() {
   outColor = vec4(col, 1.0);
 }
 `;
+
+const TOLERANCES = {
+  loose: [5e-5, 5e-7],
+  balanced: [2e-5, 2e-7],
+  strict: [1e-5, 1e-7],
+};
+
+export function geodesicShader({ integrator = 'rk4', tolerance = 'balanced', noiseMask = 0 } = {}) {
+  const tol = TOLERANCES[tolerance] || TOLERANCES.balanced;
+  const mask = Math.max(0, Math.min(7, noiseMask | 0));
+  return GEO_FRAG
+    .replace('#define INTEGRATOR_RKCK 0', `#define INTEGRATOR_RKCK ${integrator === 'rkck' ? 1 : 0}`)
+    .replace(/#define NOISE_MASK [0-7]/, `#define NOISE_MASK ${mask}`)
+    .replace('#define RK_REL_TOL 2e-5', `#define RK_REL_TOL ${tol[0].toExponential(8)}`)
+    .replace('#define RK_ABS_TOL 2e-7', `#define RK_ABS_TOL ${tol[1].toExponential(8)}`);
+}
 
 /* ---------------- post: threshold bright pass ---------------- */
 

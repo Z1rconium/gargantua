@@ -8,7 +8,7 @@ import {
   PARAM_SCHEMA, defaultParams, QUALITY, QUALITY_ORDER, PRESETS,
   DEBUG_NAMES, CINE_PERIOD,
 } from './config.js';
-import { VERT, GEO_FRAG, BRIGHT_FRAG, BLUR_FRAG, FINAL_FRAG } from './shaders.js';
+import { VERT, GEO_FRAG, BRIGHT_FRAG, BLUR_FRAG, FINAL_FRAG, geodesicShader } from './shaders.js';
 import { loadState, saveState, clearState, parseQuery } from './state.js';
 import { AmbientAudio } from './audio.js';
 import { HUD } from './hud.js';
@@ -127,6 +127,19 @@ function makeRT(w, h) {
   return rt;
 }
 
+function makeReadRT(w, h) {
+  const rt = new THREE.WebGLRenderTarget(w, h, {
+    type: THREE.UnsignedByteType,
+    format: THREE.RGBAFormat,
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    depthBuffer: false,
+    stencilBuffer: false,
+  });
+  rt.texture.generateMipmaps = false;
+  return rt;
+}
+
 function allocRTs(w, h) {
   sw = w; sh = h;
   if (rtScene) rtScene.dispose();
@@ -228,11 +241,10 @@ function draw(mat, rt) {
   renderer.render(scene, dummyCam);
 }
 
-function renderFrame() {
+function updateGeoUniforms(benchMode = 0) {
   const time = app.fixedTime !== null ? app.fixedTime : app.time;
   const p = app.params;
   updateCameraBasis(time);
-
   const U = matGeo.uniforms;
   U.uResolution.value.set(sw, sh);
   U.uTime.value = time % 4096;
@@ -256,7 +268,18 @@ function renderFrame() {
   U.uStarDensity.value = p.starDensity;
   U.uMilkyWay.value = p.milkyWay;
   U.uDebug.value = app.debug;
-  draw(matGeo, rtScene);
+  U.uBenchMode.value = benchMode;
+}
+
+function drawGeodesic(rt = rtScene, benchMode = 0) {
+  updateGeoUniforms(benchMode);
+  draw(matGeo, rt);
+}
+
+function renderFrame() {
+  const time = app.fixedTime !== null ? app.fixedTime : app.time;
+  const p = app.params;
+  drawGeodesic(rtScene, 0);
 
   matBright.uniforms.tSrc.value = rtScene.texture;
   matBright.uniforms.uThr.value = p.bloomThr;
@@ -512,7 +535,14 @@ async function start() {
   quad.frustumCulled = false;
   scene.add(quad);
 
-  matGeo = rawMat(GEO_FRAG, {
+  const benchIntegrator = query.integrator === 'rkck' ? 'rkck' : 'rk4';
+  const benchTolerance = ['loose', 'balanced', 'strict'].includes(query.tolerance)
+    ? query.tolerance : 'balanced';
+  const benchNoiseMask = Number.isInteger(query.noiseMask) ? Math.max(0, Math.min(7, query.noiseMask)) : 0;
+  const initialGeoFrag = query.bench
+    ? geodesicShader({ integrator: benchIntegrator, tolerance: benchTolerance, noiseMask: benchNoiseMask })
+    : GEO_FRAG;
+  const geoUniforms = () => ({
     uResolution: { value: new THREE.Vector2() },
     uTime: { value: 0 },
     uCamPos: { value: new THREE.Vector3() },
@@ -535,7 +565,9 @@ async function start() {
     uStarDensity: { value: 1 },
     uMilkyWay: { value: 1 },
     uDebug: { value: 0 },
+    uBenchMode: { value: 0 },
   });
+  matGeo = rawMat(initialGeoFrag, geoUniforms());
   matBright = rawMat(BRIGHT_FRAG, {
     tSrc: { value: null },
     uThr: { value: 0.85 },
@@ -672,6 +704,48 @@ async function start() {
           getErrLog: () => app.errLog.slice(0, 10),
         }))
         .catch((e) => console.log('[GARGANTUA] PROBE_FAILED ' + e.message));
+    }, 1800);
+  }
+
+  if (query.bench) {
+    setTimeout(() => {
+      import('./bench.js')
+        .then((m) => m.runBench({
+          app, renderer, renderFrame,
+          getInternal: () => ({ w: sw, h: sh }),
+          getHDR: () => rtType === THREE.HalfFloatType,
+          setVariant: (variant) => {
+            const old = matGeo;
+            matGeo = rawMat(geodesicShader(variant), geoUniforms());
+            old.dispose();
+          },
+          drawGeodesic,
+          makeReadTarget: () => makeReadRT(sw, sh),
+          readTarget: (rt) => {
+            const pixels = new Uint8Array(rt.width * rt.height * 4);
+            renderer.readRenderTargetPixels(rt, 0, 0, rt.width, rt.height, pixels);
+            return pixels;
+          },
+          readOutput: () => {
+            renderFrame();
+            const canvas = document.createElement('canvas');
+            canvas.width = outW;
+            canvas.height = outH;
+            const context = canvas.getContext('2d', { willReadFrequently: true });
+            context.drawImage(renderer.domElement, 0, 0, outW, outH);
+            return {
+              width: outW,
+              height: outH,
+              pixels: new Uint8Array(context.getImageData(0, 0, outW, outH).data),
+            };
+          },
+          stopLoop: () => renderer.setAnimationLoop(null),
+        }))
+        .catch((e) => {
+          app.errLog.push('bench: ' + String(e));
+          window.__GARGANTUA_BENCH_DONE = { error: String(e) };
+          console.log('[GARGANTUA] BENCH_FAILED ' + e.message);
+        });
     }, 1800);
   }
 }

@@ -105,7 +105,17 @@ assets/ambient.wav    合成氛围音（tools/make_audio.py 生成）
 
 环境：macOS · Apple M1 Pro · Chrome 151 headless（ANGLE Metal 真实 GPU）· three r171。
 
-- 静态资源 11/11 全部 200（含 vendor 与音频）；ES Module 语法检查 7/7 通过。
+### 隐藏 shader 基准
+
+`?bench=1&int=rk4|rkck&tol=loose|balanced|strict&noiseMask=0..7` 会冻结画面，
+预热 12 帧，并收集 30 个有效的 geodesic GPU timer 样本。报告写入
+`window.__GARGANTUA_BENCH_REPORT`，完成时设置
+`window.__GARGANTUA_BENCH_DONE = true`，同时 POST 到 probe sink。可用
+`orbits=2|4` 覆盖基准轨道预算（默认 4）。若
+`EXT_disjoint_timer_query_webgl2` 缺失，报告只包含明确标注、不可用于默认晋级的
+blocking wall-time。
+
+- 静态资源 11/11 全部 200（含 vendor 与音频）；ES Module 语法检查 8/8 通过。
 - 自动化验收（`?probe=1` 页内自检探针 + `tools/test_server.py` 回收报告与整帧 PNG）：
   - 桌面 1280×720：**19/19 PASS** —— 非黑屏（非黑像素 54–70%）、高光与暖色盘面、
     HUD 21 滑杆 / 4 预设 / 3 质量档 / 抽屉开合 / 遥测活跃、快捷键 0–9 · ⇧1–4 ·
