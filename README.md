@@ -79,7 +79,7 @@ http://localhost:8613/?w=1920&h=1080&t=12.5&preset=1&q=cinematic&hud=0&shot=1
 `window.__GARGANTUA_SHOT_DONE = true`、`window.__GARGANTUA_LAST_SHOT`(dataURL)，
 控制台输出 `[GARGANTUA] SHOT_READY` 供 puppeteer/CDP 等待。
 
-运行时 API：`window.GARGANTUA.{set(k,v), preset(n), quality(q), debug(n), cine(b), freeze(t), thaw(), capture(w,h), stats()}`。
+运行时 API：`window.GARGANTUA.{set(k,v), preset(n), quality(q), debug(n), cine(b), freeze(t), thaw(), capture(w,h), benchmark(), benchmarkStatus(), stats()}`。
 
 ## 容错 / Resilience
 
@@ -114,6 +114,20 @@ assets/ambient.wav    合成氛围音（tools/make_audio.py 生成）
 `orbits=2|4` 覆盖基准轨道预算（默认 4）。若
 `EXT_disjoint_timer_query_webgl2` 缺失，报告只包含明确标注、不可用于默认晋级的
 blocking wall-time。
+
+### 主页本机自动调优
+
+HUD 右下角的 **Bench** 会在当前设备上冻结当前画面并依次标定质量档、噪声
+mask、轨道预算与 RKCK 容差。它优先保留可持续的最高质量档，然后仅在 GPU timer
+收集到完整样本、画面/终止分类未退化且候选满足速度阈值时应用获胜配置。运行状态仅在
+按钮中显示；结束后渲染会恢复。
+
+获胜配置只保存到本浏览器的 `localStorage`，并绑定 WebGL renderer/HDR 信息；更换
+GPU、浏览器渲染器或能力后会自动回退到 shipped 默认值。没有
+`EXT_disjoint_timer_query_webgl2` 时 Bench 只生成建议，不会更改或保存设置。可从
+控制台调用 `window.GARGANTUA.benchmark()`，并通过
+`window.__GARGANTUA_AUTO_BENCH_REPORT` 查看完整决策报告；双击 **Reset** 可清除
+保存的调优结果。
 
 - 静态资源 11/11 全部 200（含 vendor 与音频）；ES Module 语法检查 8/8 通过。
 - 自动化验收（`?probe=1` 页内自检探针 + `tools/test_server.py` 回收报告与整帧 PNG）：

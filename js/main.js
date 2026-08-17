@@ -6,9 +6,10 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   PARAM_SCHEMA, defaultParams, QUALITY, QUALITY_ORDER, PRESETS,
-  DEBUG_NAMES, CINE_PERIOD,
+  DEBUG_NAMES, CINE_PERIOD, SHIPPED_SHADER_VARIANT, BENCHMARK_VERSION,
+  BENCHMARK_QUALITY_P95_MS, normalizeShaderVariant,
 } from './config.js';
-import { VERT, GEO_FRAG, BRIGHT_FRAG, BLUR_FRAG, FINAL_FRAG, geodesicShader } from './shaders.js';
+import { VERT, BRIGHT_FRAG, BLUR_FRAG, FINAL_FRAG, geodesicShader } from './shaders.js';
 import { loadState, saveState, clearState, parseQuery } from './state.js';
 import { AmbientAudio } from './audio.js';
 import { HUD } from './hud.js';
@@ -55,7 +56,11 @@ const app = {
   fixedSize: null,
   frame: 0,
   shotPending: false,
+  shaderVariant: { ...SHIPPED_SHADER_VARIANT },
+  benchmark: null,
+  benchmarkRunning: false,
 };
+const shippedQuality = app.quality;
 
 const query = parseQuery();
 const stored = loadState();
@@ -69,6 +74,10 @@ if (stored) {
     }
   }
   if (QUALITY[stored.quality]) app.quality = stored.quality;
+  if (stored.tuning && stored.tuning.version === BENCHMARK_VERSION && stored.tuning.variant) {
+    app.shaderVariant = normalizeShaderVariant(stored.tuning.variant);
+    app.benchmark = stored.tuning;
+  }
   if (typeof stored.cine === 'boolean') app.cine = stored.cine;
   if (typeof stored.music === 'boolean') app.musicOn = stored.music;
   if (typeof stored.hud === 'boolean') app.hudVisible = stored.hud;
@@ -92,6 +101,27 @@ const rtB = [null, null, null, null];
 const rtT = [null, null, null, null];
 let rtType = THREE.HalfFloatType;
 let outW = 2, outH = 2, sw = 2, sh = 2;
+let frameLoop = null;
+let loopRunning = false;
+let candidateShaderError = null;
+let applyShaderVariant = null;
+
+function rendererSignature() {
+  const gl = renderer.getContext();
+  const info = gl.getExtension('WEBGL_debug_renderer_info');
+  return {
+    vendor: info ? gl.getParameter(info.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+    renderer: info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+    webglVersion: gl.getParameter(gl.VERSION),
+    glslVersion: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
+    hdr: rtType === THREE.HalfFloatType,
+  };
+}
+
+function sameRendererSignature(a, b) {
+  return !!a && !!b && a.vendor === b.vendor && a.renderer === b.renderer
+    && a.webglVersion === b.webglVersion && a.glslVersion === b.glslVersion && a.hdr === b.hdr;
+}
 
 const camPos = new THREE.Vector3();
 const camRight = new THREE.Vector3();
@@ -326,11 +356,13 @@ function scheduleSave() {
       music: app.musicOn,
       hud: app.hudVisible,
       cam: perspCam ? perspCam.position.toArray() : null,
+      tuning: app.benchmark,
     });
   }, 400);
 }
 
 function setParam(key, v, silent) {
+  if (app.benchmarkRunning && !silent) return;
   const s = SCHEMA_BY_KEY[key];
   if (!s || !Number.isFinite(v)) return;
   app.params[key] = Math.min(s.max, Math.max(s.min, v));
@@ -342,14 +374,15 @@ function setParam(key, v, silent) {
   if (!silent) scheduleSave();
 }
 
-function setQuality(q, announce = true) {
+function setQuality(q, announce = true, persist = true) {
+  if (app.benchmarkRunning && persist) return;
   if (!QUALITY[q]) return;
   app.quality = q;
   setParam('steps', QUALITY[q].steps, true);
   resize();
   hud.setQuality(q);
   if (announce) hud.toast(`QUALITY — ${q.toUpperCase()} · ${QUALITY[q].steps} STEPS`);
-  scheduleSave();
+  if (persist) scheduleSave();
 }
 
 function applyPreset(i, announce = true) {
@@ -424,10 +457,126 @@ function requestReset() {
   }
 }
 
+async function runAutoBenchmark() {
+  if (app.benchmarkRunning || app.ctxLost || !app.booted) return;
+  if (document.visibilityState !== 'visible') {
+    hud.toast('KEEP THIS TAB VISIBLE TO BENCHMARK');
+    return;
+  }
+
+  const snapshot = {
+    params: { ...app.params },
+    quality: app.quality,
+    variant: { ...app.shaderVariant },
+    fixedTime: app.fixedTime,
+    cine: app.cine,
+    paused: app.paused,
+    loopRunning,
+  };
+  const oldShaderHandler = renderer.debug.onShaderError;
+  clearTimeout(saveTimer);
+  app.benchmarkRunning = true;
+  hud.setBenchmarkState({ running: true, label: '0/16' });
+  stopRenderLoop();
+  candidateShaderError = null;
+  renderer.debug.onShaderError = (gl, program, vs, fs) => {
+    candidateShaderError = (gl.getShaderInfoLog(fs) || gl.getShaderInfoLog(vs) || 'shader compile failed').trim();
+  };
+  app.fixedTime = app.fixedTime === null ? 10 : app.fixedTime;
+  app.cine = false;
+  app.paused = true;
+  app.params.grain = 0;
+  app.params.chroma = 0;
+
+  const restore = () => {
+    setQuality(snapshot.quality, false, false);
+    Object.assign(app.params, snapshot.params);
+    app.fixedTime = snapshot.fixedTime;
+    app.cine = snapshot.cine;
+    app.paused = snapshot.paused;
+    applyShaderVariant(snapshot.variant);
+    hud.syncParams(app.params);
+    hud.setQuality(app.quality);
+    hud.setCine(app.cine);
+  };
+
+  try {
+    const { runAutoBench } = await import('./bench.js');
+    const result = await runAutoBench({
+      app,
+      renderer,
+      renderFrame,
+      drawGeodesic,
+      makeReadTarget: () => makeReadRT(sw, sh),
+      readTarget: (rt) => {
+        const pixels = new Uint8Array(rt.width * rt.height * 4);
+        renderer.readRenderTargetPixels(rt, 0, 0, rt.width, rt.height, pixels);
+        return pixels;
+      },
+      readOutput: () => {
+        renderFrame();
+        const canvas = document.createElement('canvas');
+        canvas.width = outW;
+        canvas.height = outH;
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        context.drawImage(renderer.domElement, 0, 0, outW, outH);
+        return { width: outW, height: outH, pixels: new Uint8Array(context.getImageData(0, 0, outW, outH).data) };
+      },
+      setVariant: (variant) => { candidateShaderError = null; applyShaderVariant(variant); },
+      setQuality,
+      qualityOrder: ['cinematic', 'high', 'standard'],
+      qualityP95Ms: BENCHMARK_QUALITY_P95_MS,
+      getInternal: () => ({ w: sw, h: sh }),
+      getOutput: () => ({ width: outW, height: outH }),
+      getEnvironment: rendererSignature,
+      throwIfShaderError: () => {
+        if (candidateShaderError) throw new Error(candidateShaderError.slice(0, 280));
+      },
+      onProgress: (done, total, label) => hud.setBenchmarkState({ running: true, label: `${done}/${total}` }),
+    });
+    window.__GARGANTUA_AUTO_BENCH_REPORT = result.report;
+    if (!result.promotionEligible) {
+      restore();
+      hud.toast('BENCHMARK ADVISORY ONLY — GPU TIMER UNAVAILABLE', 3500);
+      return result;
+    }
+
+    const winner = result.winner.candidate;
+    restore();
+    setQuality(winner.quality, false, false);
+    app.params.maxOrbits = winner.orbits;
+    applyShaderVariant(winner.variant);
+    app.benchmark = {
+      version: BENCHMARK_VERSION,
+      variant: { ...winner.variant },
+      quality: winner.quality,
+      orbits: winner.orbits,
+      environment: rendererSignature(),
+      summary: result.report.summary,
+    };
+    hud.syncParams(app.params);
+    hud.setQuality(app.quality);
+    scheduleSave();
+    hud.toast(`APPLIED — ${winner.quality.toUpperCase()} · ${winner.variant.integrator.toUpperCase()} · N${winner.variant.noiseMask} · ${winner.orbits}τ`, 4200);
+    return result;
+  } catch (err) {
+    restore();
+    app.errLog.push('auto bench: ' + String(err));
+    hud.toast(`BENCHMARK KEPT CURRENT SETTINGS — ${String(err.message || err).slice(0, 72)}`, 4200);
+    return null;
+  } finally {
+    renderer.debug.onShaderError = oldShaderHandler;
+    app.benchmarkRunning = false;
+    hud.setBenchmarkState({ running: false });
+    if (snapshot.loopRunning && !app.ctxLost && fatalEl.hidden) startRenderLoop();
+  }
+}
+
 function onKey(e) {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+  if (app.benchmarkRunning) return;
 
   if (e.code.startsWith('Digit')) {
     const n = parseInt(e.code.slice(5), 10);
@@ -461,6 +610,21 @@ function onKey(e) {
 
 let emaDt = 16.7;
 let lastTele = 0;
+let lastFrame = performance.now();
+
+function stopRenderLoop() {
+  if (!renderer || !loopRunning) return;
+  renderer.setAnimationLoop(null);
+  loopRunning = false;
+}
+
+function startRenderLoop() {
+  if (!renderer || loopRunning || app.ctxLost || !app.booted) return;
+  lastFrame = performance.now();
+  renderer.setAnimationLoop(frameLoop);
+  loopRunning = true;
+}
+
 function updateTelemetry(now) {
   if (now - lastTele < 250 || !app.hudVisible) return;
   lastTele = now;
@@ -508,6 +672,15 @@ async function start() {
     ? THREE.HalfFloatType
     : THREE.UnsignedByteType;
   renderer.autoClear = false;
+  if (app.benchmark && !sameRendererSignature(app.benchmark.environment, rendererSignature())) {
+    app.benchmark = null;
+    app.shaderVariant = { ...SHIPPED_SHADER_VARIANT };
+    app.params.maxOrbits = defaultParams().maxOrbits;
+    if (!(query.quality && QUALITY[query.quality])) {
+      app.quality = shippedQuality;
+      app.params.steps = QUALITY[shippedQuality].steps;
+    }
+  }
   renderer.debug.onShaderError = (gl, program, vs, fs) => {
     const log = (gl.getShaderInfoLog(fs) || gl.getShaderInfoLog(vs) || 'unknown').trim();
     fatal('GLSL compilation failed: ' + log.slice(0, 400), 'Your GPU/driver rejected the geodesic shader. Please report this log.');
@@ -516,6 +689,7 @@ async function start() {
   canvas.addEventListener('webglcontextlost', (e) => {
     e.preventDefault();
     app.ctxLost = true;
+    stopRenderLoop();
     bootEl.classList.remove('gone');
     bootMsg(50, 'GPU CONTEXT LOST — WAITING FOR RESTORE');
   });
@@ -523,6 +697,7 @@ async function start() {
     resize();
     app.ctxLost = false;
     bootEl.classList.add('gone');
+    startRenderLoop();
   });
 
   bootMsg(28, 'BUILDING RENDER PIPELINE');
@@ -539,9 +714,10 @@ async function start() {
   const benchTolerance = ['loose', 'balanced', 'strict'].includes(query.tolerance)
     ? query.tolerance : 'balanced';
   const benchNoiseMask = Number.isInteger(query.noiseMask) ? Math.max(0, Math.min(7, query.noiseMask)) : 0;
-  const initialGeoFrag = query.bench
-    ? geodesicShader({ integrator: benchIntegrator, tolerance: benchTolerance, noiseMask: benchNoiseMask })
-    : GEO_FRAG;
+  const initialVariant = query.bench
+    ? { integrator: benchIntegrator, tolerance: benchTolerance, noiseMask: benchNoiseMask }
+    : app.shaderVariant;
+  app.shaderVariant = normalizeShaderVariant(initialVariant);
   const geoUniforms = () => ({
     uResolution: { value: new THREE.Vector2() },
     uTime: { value: 0 },
@@ -567,7 +743,14 @@ async function start() {
     uDebug: { value: 0 },
     uBenchMode: { value: 0 },
   });
-  matGeo = rawMat(initialGeoFrag, geoUniforms());
+  matGeo = rawMat(geodesicShader(app.shaderVariant), geoUniforms());
+  applyShaderVariant = (variant) => {
+    const next = normalizeShaderVariant(variant);
+    const old = matGeo;
+    matGeo = rawMat(geodesicShader(next), geoUniforms());
+    app.shaderVariant = next;
+    if (old) old.dispose();
+  };
   matBright = rawMat(BRIGHT_FRAG, {
     tSrc: { value: null },
     uThr: { value: 0.85 },
@@ -620,12 +803,13 @@ async function start() {
   hud = new HUD(document.getElementById('hud'), {
     onParam: (k, v) => setParam(k, v),
     onParamReset: (k) => { setParam(k, SCHEMA_BY_KEY[k].def); hud.toast(`${SCHEMA_BY_KEY[k].label.toUpperCase()} — DEFAULT`); },
-    onPreset: (i) => applyPreset(i),
+    onPreset: (i) => { if (!app.benchmarkRunning) applyPreset(i); },
     onQuality: (q) => setQuality(q),
-    onCine: () => setCine(!app.cine),
-    onAudio: () => toggleMusic(),
-    onShot: () => captureShot(),
-    onReset: () => requestReset(),
+    onCine: () => { if (!app.benchmarkRunning) setCine(!app.cine); },
+    onAudio: () => { if (!app.benchmarkRunning) toggleMusic(); },
+    onShot: () => { if (!app.benchmarkRunning) captureShot(); },
+    onBench: () => runAutoBenchmark(),
+    onReset: () => { if (!app.benchmarkRunning) requestReset(); },
   });
   hud.syncParams(app.params);
   hud.setQuality(app.quality);
@@ -671,13 +855,14 @@ async function start() {
     freeze: (t) => { app.fixedTime = Number.isFinite(t) ? t : 0; },
     thaw: () => { app.fixedTime = null; },
     capture: (w, h) => captureShot(w, h),
+    benchmark: () => runAutoBenchmark(),
+    benchmarkStatus: () => ({ running: app.benchmarkRunning, tuning: app.benchmark }),
     stats: () => ({ fps: Math.round(1000 / emaDt), ms: emaDt, res: [sw, sh], out: [outW, outH] }),
   };
 
-  let prev = performance.now();
-  renderer.setAnimationLoop((now) => {
-    const dt = Math.min(100, now - prev);
-    prev = now;
+  frameLoop = (now) => {
+    const dt = Math.min(100, now - lastFrame);
+    lastFrame = now;
     emaDt = emaDt * 0.9 + dt * 0.1;
     if (!app.paused) app.time += dt / 1000;
     if (app.ctxLost) return;
@@ -691,7 +876,8 @@ async function start() {
       window.__GARGANTUA_SHOT_DONE = true;
       console.log('[GARGANTUA] SHOT_READY');
     }
-  });
+  };
+  startRenderLoop();
 
   if (query.probe) {
     setTimeout(() => {
@@ -714,11 +900,7 @@ async function start() {
           app, renderer, renderFrame,
           getInternal: () => ({ w: sw, h: sh }),
           getHDR: () => rtType === THREE.HalfFloatType,
-          setVariant: (variant) => {
-            const old = matGeo;
-            matGeo = rawMat(geodesicShader(variant), geoUniforms());
-            old.dispose();
-          },
+          setVariant: (variant) => applyShaderVariant(variant),
           drawGeodesic,
           makeReadTarget: () => makeReadRT(sw, sh),
           readTarget: (rt) => {
@@ -739,7 +921,7 @@ async function start() {
               pixels: new Uint8Array(context.getImageData(0, 0, outW, outH).data),
             };
           },
-          stopLoop: () => renderer.setAnimationLoop(null),
+          stopLoop: stopRenderLoop,
         }))
         .catch((e) => {
           app.errLog.push('bench: ' + String(e));

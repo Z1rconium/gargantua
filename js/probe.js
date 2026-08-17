@@ -55,6 +55,8 @@ export async function runProbe(ctx) {
   ok('hud.sliders21', hudEl.querySelectorAll('input[type=range]').length === 21);
   ok('hud.presets4', hudEl.querySelectorAll('[data-t=presets] .btn').length === 4);
   ok('hud.quality3', hudEl.querySelectorAll('[data-t=quality] .btn').length === 3);
+  const benchButton = hudEl.querySelector('[data-t=bench]');
+  ok('hud.benchButton', !!benchButton && benchButton.type === 'button' && !!benchButton.title);
   const panel = hudEl.querySelector('[data-t=panel]');
   const wasClosed = panel.classList.contains('closed');
   hudEl.querySelector('[data-t=drawer]').click();

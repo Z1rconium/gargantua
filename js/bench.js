@@ -356,3 +356,197 @@ export async function runBench(ctx) {
   window.__GARGANTUA_BENCH_DONE = true;
   console.log('[GARGANTUA] BENCH_DONE ' + JSON.stringify({ variant, gpu: report.gpuGeodesic }));
 }
+
+const AUTO_VISUAL_MEAN_MAX = 2 / 255;
+const AUTO_VISUAL_P99_MAX = 16 / 255;
+const AUTO_TERM_EPSILON_PCT = 0.05;
+
+function variantLabel(variant) {
+  return `${variant.integrator.toUpperCase()} / ${variant.integrator === 'rkck' ? variant.tolerance.toUpperCase() : 'FIXED'} / N${variant.noiseMask}`;
+}
+
+function gpuEligible(result) {
+  return result.gpu.supported && result.gpu.validSamples === SAMPLE_COUNT;
+}
+
+function betterByGpu(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.gpu.medianMs !== b.gpu.medianMs) return a.gpu.medianMs < b.gpu.medianMs ? a : b;
+  return a.gpu.p95Ms < b.gpu.p95Ms ? a : b;
+}
+
+function autoVisualPass(result, baseline) {
+  const display = result.displayDiff;
+  const baselineTerm = baseline.diff.terminationMismatchPct;
+  return display.rgbMae <= baseline.displayDiff.rgbMae + AUTO_VISUAL_MEAN_MAX
+    && display.rgbP99 <= baseline.displayDiff.rgbP99 + AUTO_VISUAL_P99_MAX
+    && result.diff.terminationMismatchPct <= baselineTerm + AUTO_TERM_EPSILON_PCT
+    && result.diff.blackPct <= baseline.diff.blackPct + AUTO_TERM_EPSILON_PCT;
+}
+
+async function captureReference(ctx) {
+  const { app, drawGeodesic, makeReadTarget, readTarget, readOutput } = ctx;
+  const target = makeReadTarget();
+  try {
+    app.params.steps = 768;
+    ctx.setVariant({ integrator: 'rk4', tolerance: 'balanced', noiseMask: 0 });
+    drawGeodesic(target, 0);
+    ctx.renderer.getContext().finish();
+    const image = readTarget(target);
+    drawGeodesic(target, 2);
+    const termination = readTarget(target);
+    const display = readOutput();
+    return { image, termination, display };
+  } finally {
+    target.dispose();
+  }
+}
+
+async function runAutoCandidate(ctx, candidate, reference) {
+  const { app, renderer, drawGeodesic, makeReadTarget, readTarget, readOutput } = ctx;
+  ctx.setQuality(candidate.quality, false, false);
+  app.params.maxOrbits = candidate.orbits;
+  ctx.setVariant(candidate.variant);
+  await warmup(drawGeodesic);
+  ctx.throwIfShaderError?.();
+
+  const gl = renderer.getContext();
+  const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+  const samples = ext ? await collectGpuTimes(gl, ext, drawGeodesic) : null;
+  const gpu = samples
+    ? { supported: true, promotionEligible: samples.validSamples === SAMPLE_COUNT, ...samples }
+    : { supported: false, promotionEligible: false, reason: 'EXT_disjoint_timer_query_webgl2 unavailable' };
+  const fullFrameBlockingWall = collectBlockingTimes(gl, ctx.renderFrame);
+
+  if (!reference) return { candidate, gpu, fullFrameBlockingWall };
+
+  const target = makeReadTarget();
+  try {
+    drawGeodesic(target, 0);
+    const image = readTarget(target);
+    drawGeodesic(target, 2);
+    const termination = readTarget(target);
+    const display = readOutput();
+    return {
+      candidate,
+      gpu,
+      fullFrameBlockingWall,
+      diff: imageDifference(image, reference.image, termination, reference.termination),
+      displayDiff: rgbDifference(display.pixels, reference.display.pixels),
+    };
+  } finally {
+    target.dispose();
+  }
+}
+
+/**
+ * Interactive, local-only tuning suite. It intentionally uses a bounded staged
+ * search instead of a 192-way cartesian product so the HUD remains usable.
+ * main.js owns the transactional restoration and applies the returned winner.
+ */
+export async function runAutoBench(ctx) {
+  const { app, qualityOrder, qualityP95Ms, onProgress } = ctx;
+  const reports = { type: 'gargantua-auto-benchmark', version: 1, stages: {} };
+  const shipped = { integrator: 'rk4', tolerance: 'balanced', noiseMask: 7 };
+  const qualityCandidates = qualityOrder.map((quality) => ({ quality, variant: shipped, orbits: 4 }));
+  const total = qualityCandidates.length + 1 + 8 + 1 + 3;
+  let done = 0;
+  const progress = (label) => onProgress?.(++done, total, label);
+
+  // Quality uses end-to-end blocking wall-time as an advisory ladder. Shader
+  // application itself still requires valid GPU timer samples below.
+  const calibration = [];
+  for (const candidate of qualityCandidates) {
+    onProgress?.(done, total, `quality ${candidate.quality}`);
+    const result = await runAutoCandidate(ctx, candidate, null);
+    calibration.push(result);
+    progress(`quality ${candidate.quality}`);
+  }
+  reports.stages.quality = calibration;
+  const selectedQuality = qualityOrder.find((quality) => {
+    const entry = calibration.find((x) => x.candidate.quality === quality);
+    return entry && entry.fullFrameBlockingWall.p95Ms <= qualityP95Ms[quality];
+  }) || qualityOrder[qualityOrder.length - 1];
+
+  onProgress?.(done, total, 'reference');
+  ctx.setQuality(selectedQuality, false, false);
+  app.params.maxOrbits = 4;
+  const savedSteps = app.params.steps;
+  const reference = await captureReference(ctx);
+  app.params.steps = savedSteps;
+  progress('reference');
+
+  const baselineCandidate = { quality: selectedQuality, variant: { integrator: 'rk4', tolerance: 'balanced', noiseMask: 0 }, orbits: 4 };
+  onProgress?.(done, total, 'baseline');
+  const baseline = await runAutoCandidate(ctx, baselineCandidate, reference);
+  progress('baseline');
+  reports.stages.baseline = baseline;
+
+  const noise = [];
+  for (let mask = 0; mask <= 7; mask++) {
+    const candidate = { quality: selectedQuality, variant: { integrator: 'rk4', tolerance: 'balanced', noiseMask: mask }, orbits: 4 };
+    onProgress?.(done, total, `noise ${mask}/7`);
+    const result = mask === 0 ? baseline : await runAutoCandidate(ctx, candidate, reference);
+    if (mask !== 0) progress(`noise ${mask}/7`);
+    result.visualPass = autoVisualPass(result, baseline);
+    result.eligible = gpuEligible(result) && result.visualPass
+      && (mask === 0 || result.gpu.medianMs <= baseline.gpu.medianMs * 0.95);
+    noise.push(result);
+  }
+  reports.stages.noise = noise;
+  const noiseWinner = noise.filter((x) => x.eligible).reduce(betterByGpu, null) || baseline;
+
+  onProgress?.(done, total, 'orbit 2');
+  const orbitTwo = await runAutoCandidate(ctx, {
+    quality: selectedQuality,
+    variant: noiseWinner.candidate.variant,
+    orbits: 2,
+  }, reference);
+  orbitTwo.visualPass = autoVisualPass(orbitTwo, noiseWinner);
+  orbitTwo.eligible = gpuEligible(orbitTwo) && orbitTwo.visualPass
+    && orbitTwo.gpu.medianMs < noiseWinner.gpu.medianMs;
+  progress('orbit 2');
+  reports.stages.orbits = { four: noiseWinner, two: orbitTwo };
+  const orbitWinner = orbitTwo.eligible ? orbitTwo : noiseWinner;
+
+  const rkck = [];
+  for (const tolerance of ['loose', 'balanced', 'strict']) {
+    onProgress?.(done, total, `RKCK ${tolerance}`);
+    const result = await runAutoCandidate(ctx, {
+      quality: selectedQuality,
+      variant: { integrator: 'rkck', tolerance, noiseMask: orbitWinner.candidate.variant.noiseMask },
+      orbits: orbitWinner.candidate.orbits,
+    }, reference);
+    const roiImprovementPct = result.diff.photonRingRoi.rgbMae !== null
+      && orbitWinner.diff.photonRingRoi.rgbMae > 0
+      ? 100 * (1 - result.diff.photonRingRoi.rgbMae / orbitWinner.diff.photonRingRoi.rgbMae) : null;
+    result.roiImprovementPct = roiImprovementPct;
+    result.visualPass = autoVisualPass(result, orbitWinner);
+    result.eligible = gpuEligible(result) && result.visualPass
+      && roiImprovementPct !== null && roiImprovementPct >= 50
+      && result.gpu.medianMs <= orbitWinner.gpu.medianMs * 1.2;
+    rkck.push(result);
+    progress(`RKCK ${tolerance}`);
+  }
+  reports.stages.rkck = rkck;
+  const rkckWinner = rkck.filter((x) => x.eligible).reduce(betterByGpu, null);
+  const winner = rkckWinner || orbitWinner;
+
+  reports.selectedQuality = selectedQuality;
+  reports.winner = winner;
+  reports.promotionEligible = gpuEligible(winner);
+  reports.environment = {
+    ...ctx.getEnvironment(),
+    internal: ctx.getInternal(),
+    output: ctx.getOutput(),
+  };
+  reports.summary = {
+    variant: variantLabel(winner.candidate.variant),
+    quality: selectedQuality,
+    orbits: winner.candidate.orbits,
+    gpuMedianMs: winner.gpu.medianMs,
+    gpuP95Ms: winner.gpu.p95Ms,
+  };
+  return { winner, report: reports, promotionEligible: reports.promotionEligible };
+}

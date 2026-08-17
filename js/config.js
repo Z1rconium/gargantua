@@ -3,6 +3,37 @@
 
 export const STORAGE_KEY = 'gargantua.v1';
 
+// Shader variant defaults and locally persisted auto-tuning contract. Keep this
+// explicit: GEO_FRAG ships with mask 7 while geodesicShader() is also used to
+// compile runtime variants.
+export const SHIPPED_SHADER_VARIANT = Object.freeze({
+  integrator: 'rk4',
+  tolerance: 'balanced',
+  noiseMask: 7,
+});
+export const BENCHMARK_VERSION = 1;
+export const BENCHMARK_QUALITY_P95_MS = Object.freeze({
+  cinematic: 18,
+  high: 24,
+  standard: Infinity,
+});
+
+export function normalizeShaderVariant(value, fallback = SHIPPED_SHADER_VARIANT) {
+  const source = value && typeof value === 'object' ? value : fallback;
+  return {
+    integrator: source.integrator === 'rkck' ? 'rkck' : 'rk4',
+    tolerance: ['loose', 'balanced', 'strict'].includes(source.tolerance)
+      ? source.tolerance : 'balanced',
+    noiseMask: Math.max(0, Math.min(7, Number.isInteger(source.noiseMask) ? source.noiseMask : fallback.noiseMask)),
+  };
+}
+
+export function sameShaderVariant(a, b) {
+  return a.integrator === b.integrator
+    && a.tolerance === b.tolerance
+    && a.noiseMask === b.noiseMask;
+}
+
 // The 21 parameters. min/max are UI bounds; def is the shipped default.
 export const PARAM_SCHEMA = [
   // ACCRETION DISK (8)

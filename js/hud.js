@@ -5,7 +5,7 @@ import { PARAM_SCHEMA, PARAM_COUNT, PRESETS, QUALITY, QUALITY_ORDER, DEBUG_NAMES
 
 export class HUD {
   /* cb: { onParam(key, value), onParamReset(key), onPreset(i), onQuality(q),
-           onCine(), onAudio(), onShot(), onReset() } */
+           onCine(), onAudio(), onShot(), onBench(), onReset() } */
   constructor(root, cb) {
     this.root = root;
     this.cb = cb;
@@ -47,6 +47,7 @@ export class HUD {
           <button class="btn" data-t="cine" type="button" title="Cinematic orbit (Space)">Cine</button>
           <button class="btn" data-t="audio" type="button" title="Ambient audio (M)">Audio</button>
           <button class="btn" data-t="shot" type="button" title="Save PNG (S)">Shot</button>
+          <button class="btn" data-t="bench" type="button" title="Benchmark this device and apply the best settings">Bench</button>
           <button class="btn" data-t="reset" type="button" title="Reset everything (R,R)">Reset</button>
         </div>
       </div>
@@ -96,6 +97,7 @@ export class HUD {
     this.els.cine.addEventListener('click', () => { this.els.cine.blur(); this.cb.onCine(); });
     this.els.audio.addEventListener('click', () => { this.els.audio.blur(); this.cb.onAudio(); });
     this.els.shot.addEventListener('click', () => { this.els.shot.blur(); this.cb.onShot(); });
+    this.els.bench.addEventListener('click', () => { this.els.bench.blur(); this.cb.onBench(); });
     this.els.reset.addEventListener('click', () => { this.els.reset.blur(); this.cb.onReset(); });
 
     this._buildPanel();
@@ -169,6 +171,16 @@ export class HUD {
 
   setCine(on) { this.els.cine.classList.toggle('on', on); }
   setAudio(on) { this.els.audio.classList.toggle('on', on); }
+
+  setBenchmarkState(state) {
+    const b = this.els.bench;
+    const running = !!state?.running;
+    b.disabled = running;
+    b.setAttribute('aria-busy', String(running));
+    b.classList.toggle('on', running);
+    b.textContent = running ? `Bench ${state.label || '…'}` : 'Bench';
+    b.title = running ? 'Benchmark in progress' : 'Benchmark this device and apply the best settings';
+  }
 
   setDebug(n) {
     const chip = this.els.chip;

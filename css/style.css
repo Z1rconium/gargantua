@@ -65,6 +65,14 @@ html, body {
 }
 .btn:hover { color: var(--accent-hot); border-color: var(--hairline-strong); background: rgba(242, 164, 92, 0.06); }
 .btn.on { color: var(--accent); border-color: var(--hairline-strong); }
+.btn:disabled {
+  cursor: wait;
+  color: var(--accent);
+  border-color: var(--hairline-strong);
+  background: rgba(242, 164, 92, 0.06);
+  opacity: 0.82;
+}
+.btn:disabled:hover { color: var(--accent); }
 .btn:focus-visible, input:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
 
 /* corner ticks: 6px L-brackets marking an interactive region */
